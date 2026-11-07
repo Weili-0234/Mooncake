@@ -47,6 +47,9 @@ add_test(
 set_tests_properties(replica_selection_env_opt_in_test
                      PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
+add_store_test(unit_policy_test unit_policy_test.cpp)
+add_store_test(master_service_unit_policy_test
+               master_service_unit_policy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(background_worker_test background_worker_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
@@ -109,6 +112,12 @@ if(CUDAToolkit_FOUND)
 endif()
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  add_store_test(accelerator_device_copy_test accelerator_device_copy_test.cpp)
+  target_link_libraries(accelerator_device_copy_test PRIVATE CUDA::cudart)
+  add_test(NAME accelerator_device_copy_pinned_test
+           COMMAND accelerator_device_copy_test)
+  set_tests_properties(accelerator_device_copy_pinned_test
+                       PROPERTIES ENVIRONMENT "MC_GPU_COPY=pinned")
   target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
   if(USE_TENT)
     add_test(

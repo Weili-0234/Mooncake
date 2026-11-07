@@ -15,6 +15,10 @@ eviction_ratio: 0.1
 # Overrides the 0.90 code default. A value of 1.0 disables proactive
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
+# "lease" evicts the objects whose lease ran out first. "unit_gds" evicts the
+# recovery units that clients register on the admin port, whole, by
+# GreedyDual-Size (unit_* settings; see the unit eviction policy design doc).
+eviction_policy: "lease"
 
 # Dynamic MEMORY replica fanout is disabled by default. Replica removal is
 # driven by the existing memory eviction/reclaim path; when a dynamic replica

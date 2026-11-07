@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <glog/logging.h>
+#include <json/json.h>
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -1175,6 +1176,260 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
+namespace {
+
+struct HttpUnitUpdateResponse {
+    bool success{true};
+    uint64_t applied{0};
+    std::vector<std::string> errors;
+};
+YLT_REFL(HttpUnitUpdateResponse, success, applied, errors);
+
+struct HttpUnitStatsResponse {
+    bool success{true};
+    uint64_t units{0};
+    uint64_t units_dead{0};
+    uint64_t units_inner{0};
+    uint64_t units_leaf{0};
+    uint64_t units_anchor{0};
+    uint64_t objects{0};
+    uint64_t object_bytes{0};
+    uint64_t orphan_candidates{0};
+    uint64_t upserts{0};
+    uint64_t touches{0};
+    uint64_t touch_unknown{0};
+    uint64_t dead_marks{0};
+    uint64_t dead_unknown{0};
+    uint64_t member_conflicts{0};
+    uint64_t dropped_refs{0};
+    uint64_t evicted_units{0};
+    uint64_t evicted_unit_bytes{0};
+    uint64_t evicted_dead{0};
+    uint64_t evicted_inner{0};
+    uint64_t evicted_leaf{0};
+    uint64_t orphans{0};
+    uint64_t orphan_bytes{0};
+    uint64_t grace_orphans{0};
+    uint64_t grace_orphan_bytes{0};
+    uint64_t blocked{0};
+    uint64_t partial{0};
+    uint64_t lost_members{0};
+    uint64_t lost_pages{0};
+    uint64_t pending_expired{0};
+    uint64_t headroom_units{0};
+    uint64_t headroom_unit_bytes{0};
+    uint64_t headroom_orphans{0};
+    uint64_t headroom_orphan_bytes{0};
+    uint64_t heap_entries{0};
+    double clock{0.0};
+    bool checked{false};
+    std::vector<std::string> violations{};
+};
+YLT_REFL(HttpUnitStatsResponse, success, units, units_dead, units_inner,
+         units_leaf, units_anchor, objects, object_bytes, orphan_candidates,
+         upserts, touches, touch_unknown, dead_marks, dead_unknown,
+         member_conflicts, dropped_refs, evicted_units, evicted_unit_bytes,
+         evicted_dead, evicted_inner, evicted_leaf, orphans, orphan_bytes,
+         grace_orphans, grace_orphan_bytes, blocked, partial, lost_members,
+         lost_pages, pending_expired, headroom_units, headroom_unit_bytes,
+         headroom_orphans, headroom_orphan_bytes, heap_entries, clock, checked,
+         violations);
+
+// {"updates": [{"op": "upsert" | "touch" | "dead", "id": ..., "value": ...,
+// "aligned": ..., "parent": ..., "members": [...], "refs": [...]}, ...]};
+// fields an op does not use may be left out.
+tl::expected<std::vector<UnitUpdate>, std::string> ParseUnitUpdates(
+    std::string_view body) {
+    constexpr Json::ArrayIndex kMaxUpdates = 4096;
+    Json::Value root;
+    Json::CharReaderBuilder builder;
+    std::string errors;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    try {
+        if (!reader->parse(body.data(), body.data() + body.size(), &root,
+                           &errors)) {
+            return tl::make_unexpected("invalid JSON: " + errors);
+        }
+    } catch (const Json::Exception& e) {
+        // Nested deeper than the reader's stack limit.
+        return tl::make_unexpected(std::string("invalid JSON: ") + e.what());
+    }
+    if (!root.isObject()) {
+        return tl::make_unexpected(std::string("the body must be an object"));
+    }
+    const Json::Value& list = root["updates"];
+    if (!list.isArray()) {
+        return tl::make_unexpected(std::string("'updates' must be a list"));
+    }
+    if (list.size() > kMaxUpdates) {
+        return tl::make_unexpected("at most " + std::to_string(kMaxUpdates) +
+                                   " updates per request");
+    }
+    // A field may be left out (null) but not given with another type.
+    auto string = [](const Json::Value& value, std::string& out) -> bool {
+        if (value.isNull()) return true;
+        if (!value.isString()) return false;
+        out = value.asString();
+        return true;
+    };
+    auto strings = [](const Json::Value& value,
+                      std::vector<std::string>& out) -> bool {
+        if (value.isNull()) return true;
+        if (!value.isArray()) return false;
+        out.reserve(value.size());
+        for (const auto& item : value) {
+            if (!item.isString()) return false;
+            out.push_back(item.asString());
+        }
+        return true;
+    };
+    std::vector<UnitUpdate> updates;
+    updates.reserve(list.size());
+    for (const auto& item : list) {
+        if (!item.isObject()) {
+            return tl::make_unexpected(
+                std::string("each update must be an object"));
+        }
+        UnitUpdate update;
+        std::string op;
+        if (!string(item["op"], op) || !string(item["id"], update.id) ||
+            !string(item["parent"], update.parent)) {
+            return tl::make_unexpected(
+                std::string("'op', 'id' and 'parent' must be strings"));
+        }
+        if (op == "upsert") {
+            update.op = UnitOp::kUpsert;
+        } else if (op == "touch") {
+            update.op = UnitOp::kTouch;
+        } else if (op == "dead") {
+            update.op = UnitOp::kDead;
+        } else {
+            return tl::make_unexpected("unknown unit op '" + op + "'");
+        }
+        const Json::Value& value = item["value"];
+        if (!value.isNull() && !value.isNumeric()) {
+            return tl::make_unexpected(std::string("'value' must be a number"));
+        }
+        const Json::Value& aligned = item["aligned"];
+        if (!aligned.isNull() && !aligned.isBool()) {
+            return tl::make_unexpected(
+                std::string("'aligned' must be true or false"));
+        }
+        update.value = value.isNull() ? 0.0 : value.asDouble();
+        update.aligned = aligned.isBool() && aligned.asBool();
+        if (!strings(item["members"], update.members) ||
+            !strings(item["refs"], update.refs)) {
+            return tl::make_unexpected(
+                std::string("'members' and 'refs' must be lists of strings"));
+        }
+        updates.push_back(std::move(update));
+    }
+    return updates;
+}
+
+}  // namespace
+
+void MasterAdminServer::HandleUnitUpdates(coro_http::coro_http_request& req,
+                                          coro_http::coro_http_response& resp) {
+    auto updates = ParseUnitUpdates(req.get_body());
+    if (!updates.has_value()) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS, updates.error());
+        return;
+    }
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->ApplyUnitUpdates(updates.value());
+        if (!result.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        HttpUnitUpdateResponse payload;
+        payload.applied = updates->size() - result->size();
+        payload.errors = std::move(result.value());
+        payload.success = payload.errors.empty();
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
+void MasterAdminServer::HandleUnitStats(coro_http::coro_http_request& req,
+                                        coro_http::coro_http_response& resp) {
+    const auto check_value = req.get_query_value("check");
+    const bool check = check_value == "1" || check_value == "true";
+    WithActiveService(resp, [&](auto service) {
+        auto config = service->GetUnitPolicyConfig();
+        if (!config.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(config.error()),
+                               config.error());
+            return;
+        }
+        // The tier counts and the self-check scan every unit under the
+        // policy's lock, which puts wait for.
+        if (check && !config->debug) {
+            WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                               ErrorCode::INVALID_PARAMS,
+                               "check=1 needs the master's --unit_debug");
+            return;
+        }
+        auto stats = service->GetUnitPolicyStats(/*exact=*/check);
+        if (!stats.has_value()) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(stats.error()),
+                               stats.error());
+            return;
+        }
+        const UnitPolicyStats& s = stats.value();
+        HttpUnitStatsResponse payload{
+            .units = s.units,
+            .units_dead = s.units_dead,
+            .units_inner = s.units_inner,
+            .units_leaf = s.units_leaf,
+            .units_anchor = s.units_anchor,
+            .objects = s.objects,
+            .object_bytes = s.object_bytes,
+            .orphan_candidates = s.orphan_candidates,
+            .upserts = s.upserts,
+            .touches = s.touches,
+            .touch_unknown = s.touch_unknown,
+            .dead_marks = s.dead_marks,
+            .dead_unknown = s.dead_unknown,
+            .member_conflicts = s.member_conflicts,
+            .dropped_refs = s.dropped_refs,
+            .evicted_units = s.evicted_units,
+            .evicted_unit_bytes = s.evicted_unit_bytes,
+            .evicted_dead = s.evicted_by_tier[0],
+            .evicted_inner = s.evicted_by_tier[1],
+            .evicted_leaf = s.evicted_by_tier[2],
+            .orphans = s.orphans,
+            .orphan_bytes = s.orphan_bytes,
+            .grace_orphans = s.grace_orphans,
+            .grace_orphan_bytes = s.grace_orphan_bytes,
+            .blocked = s.blocked,
+            .partial = s.partial,
+            .lost_members = s.lost_members,
+            .lost_pages = s.lost_pages,
+            .pending_expired = s.pending_expired,
+            .headroom_units = s.headroom_units,
+            .headroom_unit_bytes = s.headroom_unit_bytes,
+            .headroom_orphans = s.headroom_orphans,
+            .headroom_orphan_bytes = s.headroom_orphan_bytes,
+            .heap_entries = s.heap_entries,
+            .clock = s.clock,
+        };
+        if (check) {
+            auto violations = service->CheckUnitPolicy();
+            if (!violations.has_value()) {
+                WriteErrorResponse(resp,
+                                   ErrorCodeToHttpStatus(violations.error()),
+                                   violations.error());
+                return;
+            }
+            payload.checked = true;
+            payload.violations = std::move(violations.value());
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+    });
+}
+
 struct HttpRemoveAllResponse {
     bool success{true};
     long removed_count{0};
@@ -1304,6 +1559,16 @@ void MasterAdminServer::RegisterHandler() {
         "/api/v1/remove_all",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleRemoveAll(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/units",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUnitUpdates(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/units/stats",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleUnitStats(req, resp);
         });
 }
 }  // namespace mooncake

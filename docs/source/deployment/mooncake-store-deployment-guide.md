@@ -582,6 +582,13 @@ mooncake_master \
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
+| `--eviction_policy` | `lease` | Memory eviction order: `lease` (oldest lease first) or `unit_gds` (registered recovery units, whole, by GreedyDual-Size, never soft-pinned objects whatever `--allow_evict_soft_pinned_objects` says; see [Recovery-Unit Eviction Policy](../design/store/unit-eviction-policy.md)) |
+| `--unit_leaf_last` | `true` | `unit_gds`: evict dead units first, then inner units, then leaves |
+| `--unit_idle_demote_s` | `60` | `unit_gds`: a leaf unused for this many seconds ranks as an inner unit (`0` disables) |
+| `--unit_orphan_grace_s` | `120` | `unit_gds`: seconds before an object no unit owns or references may be evicted (earlier only as a full round's last resort) |
+| `--unit_debug` | `false` | `unit_gds`: answer `GET /api/v1/units/stats?check=1` (the units per tier and the policy's self-check, scans of every unit) |
+| `--unit_anchor_tier` | `false` | `unit_gds` with leaf-last tiers: the deepest live aligned unit under a live tail ranks with the leaves |
+| `--unit_dead_headroom_ratio` | `0` | `unit_gds` with leaf-last tiers: from this fraction of the capacity below the high watermark on, evict dead units and orphans only (`0` disables) |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -1151,6 +1158,7 @@ Do not run binaries from before and after checksum support was introduced in the
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_STORE_MEMCPY` | auto | Prefer local memcpy when source/destination are on the same client. When unset, auto-detected by transport: **enabled** in a TCP-only environment, **disabled** when an RDMA/other transport is available. Accepts `1`/`true`/`yes`/`on` or `0`/`false`/`no`/`off` to override |
+| `MC_GPU_COPY` | `legacy` | CUDA builds: `pinned` copies between device memory and host memory (the store's local copies and the TCP transport's staging) with `cudaMemcpyAsync` on a non-blocking stream, through pooled pinned buffers for pageable host memory, instead of a synchronous `cudaMemcpy` on the legacy default stream, which waits for the application's work on that stream. The application must finish writing a buffer before it puts it, and must not get into device memory that queued work still reads or writes |
 | `MC_STORE_CLIENT_SETUP_RETRIES` | `20` | Number of times to retry client registration on failure |
 | `MC_CXL_DEV_SIZE` | unset | CXL device size in raw bytes for client-side allocation. **Required when `protocol="cxl"`** — the client aborts at startup if it is missing |
 

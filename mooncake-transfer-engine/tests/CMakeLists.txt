@@ -157,6 +157,12 @@ if(USE_TCP)
   target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest
                                                   gtest_main)
   add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
+  if(USE_CUDA)
+    add_test(NAME tcp_transport_pinned_gpu_copy_test
+             COMMAND tcp_transport_test --gtest_filter=TCPTransportGpuTest.*)
+    set_tests_properties(tcp_transport_pinned_gpu_copy_test
+                         PROPERTIES ENVIRONMENT "MC_GPU_COPY=pinned")
+  endif()
 
   add_executable(tcp_write_visibility_test
                  ${WORKSPACE}/tcp_write_visibility_test.cpp)

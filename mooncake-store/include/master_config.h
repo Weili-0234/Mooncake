@@ -8,6 +8,7 @@
 
 #include "config_helper.h"
 #include "types.h"
+#include "unit_policy.h"
 
 namespace mooncake {
 
@@ -46,6 +47,11 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     double nof_eviction_ratio;
     double nof_eviction_high_watermark_ratio;
+    // Memory eviction order: "lease" (oldest lease first) or "unit_gds"
+    // (recovery units ranked by GreedyDual-Size, see unit_policy.h).
+    std::string eviction_policy = "lease";
+    // Settings of "unit_gds"; `enabled` follows `eviction_policy`.
+    UnitPolicyConfig unit_policy;
     int64_t client_live_ttl_sec;
     int64_t nof_heartbeat_interval_sec;
     uint32_t nof_heartbeat_probe_timeout_ms;
@@ -488,6 +494,7 @@ class WrappedMasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    UnitPolicyConfig unit_policy;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -583,6 +590,7 @@ class WrappedMasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        unit_policy = config.unit_policy;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -796,6 +804,7 @@ class MasterServiceConfigBuilder {
     uint64_t max_kv_soft_pin_ttl_ = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    UnitPolicyConfig unit_policy_;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -872,6 +881,12 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_unit_policy(
+        const UnitPolicyConfig& config) {
+        unit_policy_ = config;
         return *this;
     }
 
@@ -1165,6 +1180,7 @@ class MasterServiceConfig {
     double nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
     double nof_eviction_high_watermark_ratio =
         DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    UnitPolicyConfig unit_policy;
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -1256,6 +1272,7 @@ class MasterServiceConfig {
         nof_eviction_ratio = config.nof_eviction_ratio;
         nof_eviction_high_watermark_ratio =
             config.nof_eviction_high_watermark_ratio;
+        unit_policy = config.unit_policy;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
@@ -1348,6 +1365,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.unit_policy = unit_policy_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.nof_eviction_ratio = nof_eviction_ratio_;

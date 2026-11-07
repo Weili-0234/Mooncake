@@ -243,6 +243,48 @@ curl http://localhost:8080/get_segments_detail
   - `allocator_capacity_bytes` (integer): Total allocator capacity in bytes
   - `allocator_usage_percent` (number): Percentage of allocator capacity used
 
+### Recovery Unit Endpoints
+
+These endpoints exist for the `unit_gds` eviction policy (`--eviction_policy=unit_gds`) and return `409 Conflict`
+under the default lease order. The policy and the fields of each update are described in
+[Recovery-Unit Eviction Policy](../../design/store/unit-eviction-policy.md).
+
+#### `/api/v1/units`
+Applies a batch of recovery-unit updates in order.
+
+**Method**: `POST`
+**Content-Type**: `application/json`
+**Request body**: `{"updates": [{"op": "upsert" | "touch" | "dead", "id": ..., "value": ..., "aligned": ..., "parent": ..., "members": [...], "refs": [...]}, ...]}`, at most 4096 updates; fields an operation does not use may be left out, the others must have their types (strings, a number, a boolean, lists of strings)
+**Response**: `{"success": <no update rejected>, "applied": <count>, "errors": [<one message per rejected update>]}`
+**Status Codes**:
+- `200 OK`: The batch was applied; rejected updates are listed in `errors`
+- `400 Bad Request`: The body is not a valid batch (not a JSON object, a field of another type, more than 4096 updates)
+- `409 Conflict`: The master runs the lease order
+
+**Example**:
+```bash
+curl -X POST http://localhost:9003/api/v1/units -H 'Content-Type: application/json' \
+  -d '{"updates": [{"op": "upsert", "id": "u1", "value": 1.5, "members": ["k1"], "refs": ["p0"]}]}'
+```
+
+#### `/api/v1/units/stats`
+Returns the policy's counters; with `check=1` also the units per tier and the violations its self-check finds.
+
+**Method**: `GET`
+**Content-Type**: `application/json`
+**Parameters**:
+- `check` (optional): `1` or `true` to count the units per tier and run the self-check, both a scan of every unit; only
+  when the master runs with `--unit_debug`. Without it `units_dead`, `units_inner`, `units_leaf` and `units_anchor` are 0
+**Status Codes**:
+- `200 OK`: Counters returned
+- `400 Bad Request`: `check=1` without `--unit_debug`
+- `409 Conflict`: The master runs the lease order
+
+**Example**:
+```bash
+curl "http://localhost:9003/api/v1/units/stats"
+```
+
 ### Health Check Endpoints
 
 #### `/health`

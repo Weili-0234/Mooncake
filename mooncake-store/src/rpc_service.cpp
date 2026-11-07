@@ -1475,6 +1475,26 @@ WrappedMasterService::ListTenantQuotaSnapshots() {
     return master_service_.ListTenantQuotaSnapshots();
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::ApplyUnitUpdates(const std::vector<UnitUpdate>& updates) {
+    return master_service_.ApplyUnitUpdates(updates);
+}
+
+tl::expected<UnitPolicyConfig, ErrorCode>
+WrappedMasterService::GetUnitPolicyConfig() const {
+    return master_service_.GetUnitPolicyConfig();
+}
+
+tl::expected<UnitPolicyStats, ErrorCode>
+WrappedMasterService::GetUnitPolicyStats(bool exact) const {
+    return master_service_.GetUnitPolicyStats(exact);
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::CheckUnitPolicy() const {
+    return master_service_.CheckUnitPolicy();
+}
+
 tl::expected<TenantQuotaSnapshot, ErrorCode>
 WrappedMasterService::GetTenantQuotaSnapshot(const std::string& tenant_id) {
     if (!master_service_.IsTenantQuotaEnabled()) {
