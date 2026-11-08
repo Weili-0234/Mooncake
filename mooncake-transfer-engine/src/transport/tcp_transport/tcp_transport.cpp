@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cctype>
 #include <chrono>
@@ -29,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <limits>
@@ -36,6 +38,8 @@
 #include <mutex>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "transfer_engine.h"

@@ -199,6 +199,15 @@ class WrappedMasterService {
     DeleteTenantQuotaPolicy(const std::string& tenant_id);
     tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
 
+    // --eviction_policy=unit_gds (MasterService::ApplyUnitUpdates and the
+    // rest).
+    tl::expected<std::vector<std::string>, ErrorCode> ApplyUnitUpdates(
+        const std::vector<UnitUpdate>& updates);
+    tl::expected<UnitPolicyConfig, ErrorCode> GetUnitPolicyConfig() const;
+    tl::expected<UnitPolicyStats, ErrorCode> GetUnitPolicyStats(
+        bool exact = false) const;
+    tl::expected<std::vector<std::string>, ErrorCode> CheckUnitPolicy() const;
+
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllSegmentsForAdmin();

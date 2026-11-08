@@ -49,6 +49,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
     task_manager.cpp
+    unit_policy.cpp
     ha/oplog/oplog_types.cpp
     ha/oplog/oplog_batch_codec.cpp
     ha/oplog/oplog_batch_storage.cpp

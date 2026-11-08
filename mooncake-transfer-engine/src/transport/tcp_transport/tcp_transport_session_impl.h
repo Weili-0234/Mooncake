@@ -80,6 +80,118 @@ static cudaError_t copyTcpCudaMemory(void* dst, const void* src, size_t size) {
 #endif
 #endif
 
+#if defined(USE_CUDA) && !defined(USE_MACA)
+// MC_GPU_COPY=pinned: a GPU slice is staged in a pinned buffer from a
+// process-wide pool and copied with cudaMemcpyAsync on a non-blocking stream
+// of the calling thread, as the USE_MACA build copies with
+// copyTcpCudaMemory. The default synchronous cudaMemcpy into a pageable
+// buffer runs on the legacy default stream, so it waits for, and delays,
+// every CUDA call the application makes on that stream.
+static bool tcpGpuCopyPinned() {
+    static const bool pinned = [] {
+        const char* env = std::getenv("MC_GPU_COPY");
+        const bool enabled = env != nullptr && std::strcmp(env, "pinned") == 0;
+        if (enabled) {
+            LOG(INFO) << "TCP transport GPU copy: pinned staging on a "
+                         "non-blocking stream (MC_GPU_COPY=pinned)";
+        }
+        return enabled;
+    }();
+    return pinned;
+}
+
+// Pinned staging buffers of one slice (getChunkSize()) each. A session owns a
+// buffer while its async read or write is in flight and returns it when that
+// operation completes. Client sessions live for one request, so buffers are
+// pooled per process and never freed (cudaFreeHost can synchronize the
+// device): the pool grows to the peak number of slices in flight.
+class TcpPinnedChunkPool {
+   public:
+    static TcpPinnedChunkPool& instance() {
+        static TcpPinnedChunkPool* pool = new TcpPinnedChunkPool();
+        return *pool;
+    }
+
+    char* acquire() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!free_.empty()) {
+                char* buf = free_.back();
+                free_.pop_back();
+                return buf;
+            }
+        }
+        void* buf = nullptr;
+        if (cudaHostAlloc(&buf, getChunkSize(), cudaHostAllocPortable) !=
+            cudaSuccess) {
+            return nullptr;
+        }
+        LOG(INFO) << "TCP pinned chunk pool: cudaHostAlloc #"
+                  << allocated_.fetch_add(1) + 1 << " (" << getChunkSize()
+                  << " bytes)";
+        return static_cast<char*>(buf);
+    }
+
+    void release(char* buf) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        free_.push_back(buf);
+    }
+
+   private:
+    std::mutex mutex_;
+    std::vector<char*> free_;
+    std::atomic<uint64_t> allocated_{0};
+};
+
+static cudaError_t copyTcpCudaPinned(void* dst, const void* src, size_t size) {
+    thread_local std::unordered_map<int, cudaStream_t> streams;
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    auto it = streams.find(device);
+    if (it == streams.end()) {
+        cudaStream_t stream;
+        status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (status != cudaSuccess) return status;
+        it = streams.emplace(device, stream).first;
+    }
+    status = cudaMemcpyAsync(dst, src, size, cudaMemcpyDefault, it->second);
+    if (status == cudaSuccess) status = cudaStreamSynchronize(it->second);
+    return status;
+}
+
+static char* acquireTcpStaging(size_t size) {
+    return tcpGpuCopyPinned() ? TcpPinnedChunkPool::instance().acquire()
+                              : new char[size];
+}
+
+static void releaseTcpStaging(char* buf) {
+    if (!buf) return;
+    if (tcpGpuCopyPinned()) {
+        TcpPinnedChunkPool::instance().release(buf);
+    } else {
+        delete[] buf;
+    }
+}
+
+static cudaError_t copyTcpStaging(void* dst, const void* src, size_t size) {
+    return tcpGpuCopyPinned() ? copyTcpCudaPinned(dst, src, size)
+                              : cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+}
+#elif defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) ||  \
+    defined(USE_COREX)
+static char* acquireTcpStaging(size_t size) { return new char[size]; }
+static void releaseTcpStaging(char* buf) { delete[] buf; }
+static cudaError_t copyTcpStaging(void* dst, const void* src, size_t size) {
+    return cudaMemcpy(dst, src, size, cudaMemcpyDefault);
+}
+#else
+// Without a GPU runtime no slice is staged; the sessions still name the
+// release on paths where cuda_device stays -1.
+static void releaseTcpStaging(char* buf) { delete[] buf; }
+#endif
+
 // Forward declaration
 class TcpTransport;
 
@@ -223,21 +335,24 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+            dram_buffer = acquireTcpStaging(buffer_size);
+            if (!dram_buffer) {
+                LOG(ERROR) << "ServerSession::writeBody: no staging buffer";
+                return;  // Connection will be closed
+            }
             cudaSetDevice(cuda_device);
 #ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+            cudaError_t cuda_status = copyTcpStaging(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #endif
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ServerSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
+                releaseTcpStaging(dram_buffer);
                 return;  // Connection will be closed
             }
         }
@@ -251,7 +366,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
                 if (cuda_device >= 0) {
-                    delete[] dram_buffer;
+                    releaseTcpStaging(dram_buffer);
                 }
 #endif
                 if (ec) {
@@ -296,7 +411,11 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+            dram_buffer = acquireTcpStaging(buffer_size);
+            if (!dram_buffer) {
+                LOG(ERROR) << "ServerSession::readBody: no staging buffer";
+                return;  // Connection will be closed
+            }
         }
 #endif
 
@@ -316,7 +435,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                             << ". Error: " << ec.message()
                             << " (value: " << ec.value() << ")";
                     }
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0) releaseTcpStaging(dram_buffer);
                     return;  // Connection will be closed
                 }
 
@@ -331,18 +450,18 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                                           dram_buffer, transferred_bytes);
 #else
                     cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                        copyTcpStaging(addr + total_transferred_bytes_,
+                                       dram_buffer, transferred_bytes);
 #endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ServerSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
+                        releaseTcpStaging(dram_buffer);
                         return;  // Connection will be closed
                     }
-                    delete[] dram_buffer;
+                    releaseTcpStaging(dram_buffer);
                 }
 #endif
                 total_transferred_bytes_ += transferred_bytes;
@@ -741,7 +860,12 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+            dram_buffer = acquireTcpStaging(buffer_size);
+            if (!dram_buffer) {
+                LOG(ERROR) << "ClientSession::readBody: no staging buffer";
+                finalize(TransferStatusEnum::FAILED, false);
+                return;
+            }
         }
 #endif
 
@@ -759,7 +883,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0) releaseTcpStaging(dram_buffer);
 #endif
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
@@ -778,7 +902,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-                    if (cuda_device >= 0) delete[] dram_buffer;
+                    if (cuda_device >= 0) releaseTcpStaging(dram_buffer);
 #endif
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
@@ -795,19 +919,19 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                           dram_buffer, transferred_bytes);
 #else
                     cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
+                        copyTcpStaging(addr + total_transferred_bytes_,
+                                       dram_buffer, transferred_bytes);
 #endif
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
                             << "ClientSession::readBody failed to copy to CUDA "
                                "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        delete[] dram_buffer;
+                        releaseTcpStaging(dram_buffer);
                         finalize(TransferStatusEnum::FAILED, false);
                         return;
                     }
-                    delete[] dram_buffer;
+                    releaseTcpStaging(dram_buffer);
                 }
 #endif
                 total_transferred_bytes_ += transferred_bytes;
@@ -856,21 +980,25 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     defined(USE_COREX)
         cuda_device = getCudaDeviceId(addr);
         if (cuda_device >= 0) {
-            dram_buffer = new char[buffer_size];
+            dram_buffer = acquireTcpStaging(buffer_size);
+            if (!dram_buffer) {
+                LOG(ERROR) << "ClientSession::writeBody: no staging buffer";
+                abortWrite();
+                return;
+            }
             cudaSetDevice(cuda_device);
 #ifdef USE_MACA
             cudaError_t cuda_status = copyTcpCudaMemory(
                 dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #else
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
+            cudaError_t cuda_status = copyTcpStaging(
+                dram_buffer, addr + total_transferred_bytes_, buffer_size);
 #endif
             if (cuda_status != cudaSuccess) {
                 LOG(ERROR) << "ClientSession::writeBody failed to copy from "
                               "CUDA memory. "
                            << "Error: " << cudaGetErrorString(cuda_status);
-                delete[] dram_buffer;
+                releaseTcpStaging(dram_buffer);
                 abortWrite();
                 return;
             }
@@ -884,7 +1012,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                 const asio::error_code& ec, std::size_t transferred_bytes) {
                 write_body_in_flight_ = false;
                 if (cuda_device >= 0) {
-                    delete[] dram_buffer;
+                    releaseTcpStaging(dram_buffer);
                 }
                 if (ec) {
                     LOG(ERROR)

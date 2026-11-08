@@ -624,6 +624,8 @@ Currently, an approximate LRU policy is adopted, where the least recently used o
 
 For grouped objects, memory eviction resolves the current group membership and attempts to reclaim eligible members together.
 
+With `--eviction_policy=unit_gds`, the master instead evicts the recovery units that clients register on its admin port, whole and by GreedyDual-Size over the recompute time each saves; see [Recovery-Unit Eviction Policy](unit-eviction-policy.md).
+
 ## Lease
 
 To avoid data conflicts, a per-object lease is granted whenever an `ExistKey` request or a `GetReplicaListRequest` request succeeds. While the lease is active, the object is protected from `Remove`, `RemoveAll`, and `Eviction` operations. Specifically, a `Remove` request targeting a leased object will fail, and a `RemoveAll` request will only delete objects without an active lease. This ensures that the object’s data can be safely read as long as the lease has not expired.
@@ -845,5 +847,6 @@ ssd-offload
 unified-parallel-tensor-io
 ssd-free-ratio-first-allocation
 engram
+unit-eviction-policy
 
 :::

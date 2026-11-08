@@ -17,10 +17,15 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "cuda_alike.h"
 #if defined(USE_CUDA) && defined(USE_NVMEOF)
@@ -339,6 +344,160 @@ TEST_F(TCPTransportTest, WriteAndRead2test) {
     LOG_ASSERT(0 == memcmp((uint8_t *)(addr), (uint8_t *)(addr) + kDataLength,
                            kDataLength));
 }
+
+#if defined(USE_CUDA) && !defined(USE_MACA)
+// Transfers whose local buffer or target buffer is CUDA device memory, which
+// the TCP transport stages through host buffers. ctest runs them with
+// MC_GPU_COPY unset (synchronous cudaMemcpy) and with MC_GPU_COPY=pinned
+// (pinned staging on a non-blocking stream).
+class TCPTransportGpuTest : public TCPTransportTest {
+   protected:
+    void SetUp() override {
+        TCPTransportTest::SetUp();
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+            cudaGetLastError();
+            GTEST_SKIP() << "no CUDA device";
+        }
+        checkCudaError(cudaSetDevice(FLAGS_gpu_id), "cudaSetDevice");
+        engine_ = std::make_unique<TransferEngine>(false);
+        auto hostname_port = parseHostNameWithPort(local_server_name);
+        ASSERT_EQ(
+            engine_->init(metadata_server, local_server_name,
+                          hostname_port.first.c_str(), hostname_port.second),
+            0);
+        ASSERT_NE(engine_->installTransport("tcp", nullptr), nullptr);
+    }
+
+    // Runs one transfer of `length` bytes between `local` and `target` in
+    // this engine's own segment; returns whether it completed.
+    bool Transfer(TransferRequest::OpCode opcode, void *local, uint64_t target,
+                  size_t length) {
+        auto segment_id = engine_->openSegment(local_server_name);
+        auto batch_id = engine_->allocateBatchID(1);
+        TransferRequest entry;
+        entry.opcode = opcode;
+        entry.length = length;
+        entry.source = static_cast<uint8_t *>(local);
+        entry.target_id = segment_id;
+        entry.target_offset = target;
+        if (!engine_->submitTransfer(batch_id, {entry}).ok()) return false;
+        TransferStatus status;
+        do {
+            if (!engine_->getTransferStatus(batch_id, 0, status).ok() ||
+                status.s == TransferStatusEnum::FAILED) {
+                return false;
+            }
+        } while (status.s != TransferStatusEnum::COMPLETED);
+        return engine_->freeBatchID(batch_id).ok();
+    }
+
+    static std::vector<char> Pattern(size_t size) {
+        std::vector<char> bytes(size);
+        for (auto &byte : bytes) byte = 'a' + lrand48() % 26;
+        return bytes;
+    }
+
+    std::unique_ptr<TransferEngine> engine_;
+};
+
+TEST_F(TCPTransportGpuTest, GpuBuffersMoveEveryByte) {
+    // Several slices, not a multiple of the slice size.
+    const size_t kDataLength = 4096000 + 123;
+    void *host = numa_alloc_onnode(kDataLength, 0);
+    void *gpu_segment = nullptr;
+    void *gpu_src = nullptr;
+    void *gpu_dst = nullptr;
+    checkCudaError(cudaMalloc(&gpu_segment, kDataLength), "cudaMalloc");
+    checkCudaError(cudaMalloc(&gpu_src, kDataLength), "cudaMalloc");
+    checkCudaError(cudaMalloc(&gpu_dst, kDataLength), "cudaMalloc");
+    ASSERT_EQ(engine_->registerLocalMemory(host, kDataLength, "cpu:0"), 0);
+    ASSERT_EQ(
+        engine_->registerLocalMemory(gpu_segment, kDataLength,
+                                     "cuda:" + std::to_string(FLAGS_gpu_id)),
+        0);
+    const std::vector<char> pattern = Pattern(kDataLength);
+    checkCudaError(cudaMemcpy(gpu_src, pattern.data(), kDataLength,
+                              cudaMemcpyHostToDevice),
+                   "cudaMemcpy");
+
+    // The local side is device memory: GPU to a host buffer and back.
+    ASSERT_TRUE(Transfer(TransferRequest::WRITE, gpu_src,
+                         reinterpret_cast<uint64_t>(host), kDataLength));
+    EXPECT_EQ(memcmp(host, pattern.data(), kDataLength), 0);
+    ASSERT_TRUE(Transfer(TransferRequest::READ, gpu_dst,
+                         reinterpret_cast<uint64_t>(host), kDataLength));
+    std::vector<char> back(kDataLength);
+    checkCudaError(
+        cudaMemcpy(back.data(), gpu_dst, kDataLength, cudaMemcpyDeviceToHost),
+        "cudaMemcpy");
+    EXPECT_EQ(back, pattern);
+
+    // Both sides are device memory: the target buffer is staged as well.
+    checkCudaError(cudaMemset(gpu_dst, 0, kDataLength), "cudaMemset");
+    ASSERT_TRUE(Transfer(TransferRequest::WRITE, gpu_src,
+                         reinterpret_cast<uint64_t>(gpu_segment), kDataLength));
+    ASSERT_TRUE(Transfer(TransferRequest::READ, gpu_dst,
+                         reinterpret_cast<uint64_t>(gpu_segment), kDataLength));
+    checkCudaError(
+        cudaMemcpy(back.data(), gpu_dst, kDataLength, cudaMemcpyDeviceToHost),
+        "cudaMemcpy");
+    EXPECT_EQ(back, pattern);
+
+    engine_->unregisterLocalMemory(gpu_segment);
+    engine_->unregisterLocalMemory(host);
+    cudaFree(gpu_dst);
+    cudaFree(gpu_src);
+    cudaFree(gpu_segment);
+    numa_free(host, kDataLength);
+}
+
+static void CUDART_CB SleepOnStream(void *seconds) {
+    std::this_thread::sleep_for(
+        std::chrono::duration<double>(*static_cast<double *>(seconds)));
+}
+
+// The synchronous cudaMemcpy waits for work queued on the legacy default
+// stream (an application's kernels); the pinned mode's copy does not.
+TEST_F(TCPTransportGpuTest, OnlyThePinnedModeIgnoresTheLegacyStream) {
+    const size_t kDataLength = 4096000;
+    void *host = numa_alloc_onnode(kDataLength, 0);
+    void *gpu_src = nullptr;
+    checkCudaError(cudaMalloc(&gpu_src, kDataLength), "cudaMalloc");
+    ASSERT_EQ(engine_->registerLocalMemory(host, kDataLength, "cpu:0"), 0);
+    const std::vector<char> pattern = Pattern(kDataLength);
+    checkCudaError(cudaMemcpy(gpu_src, pattern.data(), kDataLength,
+                              cudaMemcpyHostToDevice),
+                   "cudaMemcpy");
+    // Fill the staging pool and create the copy streams before the timing.
+    ASSERT_TRUE(Transfer(TransferRequest::WRITE, gpu_src,
+                         reinterpret_cast<uint64_t>(host), kDataLength));
+    checkCudaError(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+
+    static double kBlockSeconds = 1.5;
+    checkCudaError(
+        cudaLaunchHostFunc(cudaStreamLegacy, SleepOnStream, &kBlockSeconds),
+        "cudaLaunchHostFunc");
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(Transfer(TransferRequest::WRITE, gpu_src,
+                         reinterpret_cast<uint64_t>(host), kDataLength));
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    checkCudaError(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+    EXPECT_EQ(memcmp(host, pattern.data(), kDataLength), 0);
+    const char *mode = std::getenv("MC_GPU_COPY");
+    if (mode != nullptr && std::string(mode) == "pinned") {
+        EXPECT_LT(seconds, kBlockSeconds / 2);
+    } else {
+        EXPECT_GE(seconds, kBlockSeconds * 0.9);
+    }
+
+    engine_->unregisterLocalMemory(host);
+    cudaFree(gpu_src);
+    numa_free(host, kDataLength);
+}
+#endif
 
 }  // namespace mooncake
 

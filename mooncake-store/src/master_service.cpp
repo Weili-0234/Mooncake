@@ -472,6 +472,49 @@ MasterService::MasterService(const MasterServiceConfig& config)
 #endif
     }
 
+    if (config.unit_policy.enabled) {
+        if (enable_ha_ || enable_offload_ || enable_multi_tenants_ ||
+            config.enable_snapshot || config.enable_snapshot_restore ||
+            config.enable_cxl) {
+            throw std::invalid_argument(
+                "eviction_policy unit_gds excludes HA, offload, snapshots, "
+                "CXL and multiple tenants");
+        }
+        if (!(config.unit_policy.idle_demote_s >= 0.0) ||
+            !(config.unit_policy.orphan_grace_s >= 0.0)) {
+            throw std::invalid_argument(
+                "unit_idle_demote_s and unit_orphan_grace_s must be >= 0");
+        }
+        if ((config.unit_policy.anchor_tier ||
+             config.unit_policy.dead_headroom_ratio != 0.0) &&
+            !config.unit_policy.leaf_last) {
+            throw std::invalid_argument(
+                "unit_anchor_tier and unit_dead_headroom_ratio need "
+                "unit_leaf_last");
+        }
+        if (!(config.unit_policy.dead_headroom_ratio >= 0.0) ||
+            !(config.unit_policy.dead_headroom_ratio <
+              config.eviction_high_watermark_ratio)) {
+            throw std::invalid_argument(
+                "unit_dead_headroom_ratio must be >= 0 and below "
+                "eviction_high_watermark_ratio");
+        }
+        unit_policy_ = std::make_unique<UnitPolicy>(config.unit_policy);
+        if (allow_evict_soft_pinned_objects_) {
+            LOG(WARNING) << "Eviction policy unit_gds never evicts soft-pinned "
+                            "objects: allow_evict_soft_pinned_objects has no "
+                            "effect";
+        }
+        LOG(INFO) << "Eviction policy unit_gds: leaf_last="
+                  << config.unit_policy.leaf_last
+                  << ", idle_demote_s=" << config.unit_policy.idle_demote_s
+                  << ", orphan_grace_s=" << config.unit_policy.orphan_grace_s
+                  << ", debug=" << config.unit_policy.debug
+                  << ", anchor_tier=" << config.unit_policy.anchor_tier
+                  << ", dead_headroom_ratio="
+                  << config.unit_policy.dead_headroom_ratio;
+    }
+
     eviction_running_ = true;
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
@@ -2119,6 +2162,10 @@ MasterService::EraseMetadata(
     const std::string key = it->first;
     const std::string group_id = it->second.group_id;
     auto& metadata = it->second;
+    // A size-changing upsert replaces the object (kPreserveOld): no loss.
+    if (unit_policy_ && quota_mode != QuotaEraseMode::kPreserveOld) {
+        unit_policy_->OnObjectErased(key, UnitPolicy::Clock::now());
+    }
 
     // Clean up offloading_task + dec_refcnt before erasing metadata.
     // When BatchEvict deletes metadata, Store Worker may still have an
@@ -4646,6 +4693,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     // TODO: add inc_nof_cache_nums() (ranhaojia)
     metadata.GrantReadLease(0);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
+    if (unit_policy_ && HasCompletedMemoryCacheReplica(metadata)) {
+        unit_policy_->OnObjectStored(key, metadata.size,
+                                     UnitPolicy::Clock::now());
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::string payload = SerializeMetadataForOpLog(metadata);
@@ -9070,9 +9121,24 @@ void MasterService::EvictionThreadFunc() {
             double evict_ratio_lowerbound =
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
-            BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            if (unit_policy_) {
+                UnitBatchEvict(evict_ratio_target);
+            } else {
+                BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            }
             LOG(INFO) << "[EVICT-DONE] BatchEvict execution completed.";
             last_discard_time = now;
+        } else if (unit_policy_ &&
+                   unit_policy_->config().dead_headroom_ratio > 0.0 &&
+                   used_ratio >
+                       eviction_high_watermark_ratio_ -
+                           unit_policy_->config().dead_headroom_ratio) {
+            // Below the watermark only dead units and orphans go, so puts
+            // find room before the store is full.
+            UnitBatchEvict(
+                used_ratio - (eviction_high_watermark_ratio_ -
+                              unit_policy_->config().dead_headroom_ratio),
+                /*dead_only=*/true);
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
@@ -9115,6 +9181,10 @@ void MasterService::EvictionThreadFunc() {
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();
+        }
+        if (unit_policy_ && now - unit_last_log_ >= std::chrono::seconds(60)) {
+            unit_last_log_ = now;
+            LogUnitPolicy();
         }
 
         std::this_thread::sleep_for(
@@ -9949,6 +10019,248 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                         "(offload_force_evict=true).";
     }
     return total;
+}
+
+void MasterService::UnitBatchEvict(double evict_ratio_target, bool dead_only) {
+    const StorageUsage usage = segment_manager_.GetMemoryUsage();
+    const uint64_t target = static_cast<uint64_t>(std::ceil(
+        evict_ratio_target * static_cast<double>(usage.capacity_bytes)));
+    const auto now = std::chrono::system_clock::now();
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    if (now - unit_last_discard_ > put_start_release_timeout_sec_) {
+        // BatchEvict's census sweeps stale PutStarts on every round; this
+        // order never scans every shard, so it sweeps them here.
+        unit_last_discard_ = now;
+        for (size_t i = 0; i < kNumShards; i++) {
+            MetadataShardAccessorRW shard(this, i);
+            DiscardExpiredProcessingReplicas(shard, now);
+        }
+    }
+    uint64_t freed = 0;
+    long evicted = 0;
+    long blocked = 0;
+    bool exhausted = false;
+    while (freed < target) {
+        auto victim =
+            unit_policy_->NextVictim(UnitPolicy::Clock::now(), dead_only);
+        // Rather than refuse puts, a full round's last resort: orphans still
+        // in their grace period.
+        if (!victim && !dead_only) victim = unit_policy_->NextGraceOrphan();
+        if (!victim) {
+            exhausted = true;
+            break;
+        }
+        const UnitEvictResult result = EvictForUnitPolicy(*victim, now);
+        if (result.blocked) {
+            unit_policy_->Blocked(*victim);
+            blocked++;
+            continue;
+        }
+        unit_policy_->Evicted(*victim, result.complete, result.freed_bytes,
+                              UnitPolicy::Clock::now());
+        freed += result.freed_bytes;
+        evicted += result.evicted_objects;
+    }
+    unit_policy_->EndRound(UnitPolicy::Clock::now());
+    const uint64_t released = ReleaseExpiredDiscardedReplicas(now);
+    if (evicted > 0 || released > 0) {
+        if (!dead_only) need_mem_eviction_ = false;
+        MasterMetricManager::instance().inc_eviction_success(evicted, freed);
+        MasterMetricManager::instance().inc_mem_eviction_success(evicted,
+                                                                 freed);
+    } else if (dead_only) {
+        // Nothing dead to take: not a failed eviction, the store is below
+        // its watermark.
+    } else {
+        // Every candidate leased or still arriving: retried on the next
+        // loop; with no candidate at all there is nothing to retry.
+        if (exhausted && blocked == 0) need_mem_eviction_ = false;
+        MasterMetricManager::instance().inc_eviction_fail();
+        MasterMetricManager::instance().inc_mem_eviction_fail();
+    }
+    VLOG(1) << "action=unit_evict, target_bytes=" << target
+            << ", freed_bytes=" << freed << ", evicted_objects=" << evicted
+            << ", blocked=" << blocked << ", released_discarded=" << released;
+}
+
+MasterService::UnitEvictResult MasterService::EvictForUnitPolicy(
+    const UnitPolicy::Victim& victim,
+    const std::chrono::system_clock::time_point& now) {
+    const TenantId& tenant_id = TenantId::Default();
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsEvictableMemoryReplica(replica);
+    };
+    auto evictable = [&](const std::string& key,
+                         const ObjectMetadata& metadata) {
+        return unit_policy_->StillEvictable(victim, key) &&
+               !metadata.IsHardPinned() && metadata.IsLeaseExpired() &&
+               !IsSoftPinActive(metadata, now) &&
+               metadata.HasReplica(is_evictable_memory_replica);
+    };
+    UnitEvictResult result;
+    for (const auto& key : victim.keys) {
+        MetadataShardAccessorRW shard(this,
+                                      getMetadataShardIndex(tenant_id, key));
+        auto tenant_it = shard->tenants.find(tenant_id);
+        if (tenant_it == shard->tenants.end()) continue;
+        auto it = tenant_it->second.metadata.find(key);
+        if (it == tenant_it->second.metadata.end()) continue;
+        if (!evictable(key, it->second)) {
+            result.blocked = true;
+            return result;
+        }
+    }
+    if (unit_evict_between_passes_for_testing_) {
+        unit_evict_between_passes_for_testing_();
+    }
+    // Until a key went (erased here or found gone), a key that stopped being
+    // evictable since the first pass (a touch, a lease) leaves the victim
+    // whole: blocked, not partly evicted.
+    bool went = false;
+    for (const auto& key : victim.keys) {
+        std::vector<Replica> replicas;
+        {
+            MetadataShardAccessorRW shard(
+                this, getMetadataShardIndex(tenant_id, key));
+            auto tenant_it = shard->tenants.find(tenant_id);
+            if (tenant_it == shard->tenants.end()) {
+                // Gone without an erase the policy saw (a failed upsert).
+                unit_policy_->OnObjectErased(key, UnitPolicy::Clock::now());
+                went = true;
+                continue;
+            }
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.find(key);
+            if (it == tenant_state.metadata.end()) {
+                unit_policy_->OnObjectErased(key, UnitPolicy::Clock::now());
+                went = true;
+                continue;
+            }
+            auto& metadata = it->second;
+            if (!evictable(key, metadata)) {
+                if (!went) {
+                    result.blocked = true;
+                    return result;
+                }
+                result.complete = false;
+                continue;
+            }
+            went = true;
+            replicas = PopReplicasWithCacheTotalAccounting(
+                metadata, is_evictable_memory_replica);
+            std::vector<ReplicaID> erased_ids;
+            erased_ids.reserve(replicas.size());
+            for (const auto& replica : replicas) {
+                erased_ids.push_back(replica.id());
+            }
+            RecordDynamicReplicaRemoval(metadata, erased_ids);
+            const uint64_t freed = metadata.size * replicas.size();
+            result.freed_bytes += freed;
+            result.evicted_objects++;
+            PublishKvRemovedAfterEvict(key, freed, "cpu", metadata, tenant_id);
+            if (metadata.IsValid()) {
+                result.complete = false;
+            } else {
+                EraseMetadata(tenant_state, it, tenant_id,
+                              QuotaEraseMode::kFull, &shard);
+            }
+            if (tenant_state.Empty()) shard->tenants.erase(tenant_it);
+        }
+        // The replicas' buffers go back to their allocators here, outside the
+        // shard lock.
+    }
+    return result;
+}
+
+void MasterService::LogUnitPolicy() {
+    // Counters only: the units per tier take a scan of every unit under the
+    // policy's lock, which puts wait for.
+    const UnitPolicyStats s = unit_policy_->Counters(UnitPolicy::Clock::now());
+    std::string tiers;
+    if (unit_policy_->config().leaf_last) {
+        tiers = " evicted_dead=" + std::to_string(s.evicted_by_tier[0]) +
+                " evicted_inner=" + std::to_string(s.evicted_by_tier[1]) +
+                " evicted_leaf=" + std::to_string(s.evicted_by_tier[2]);
+    }
+    LOG(INFO) << "[UNIT-POLICY] units=" << s.units << " objects=" << s.objects
+              << " object_bytes=" << s.object_bytes
+              << " orphan_candidates=" << s.orphan_candidates
+              << " upserts=" << s.upserts << " touches=" << s.touches
+              << " touch_unknown=" << s.touch_unknown
+              << " dead_marks=" << s.dead_marks
+              << " evicted_units=" << s.evicted_units
+              << " evicted_unit_bytes=" << s.evicted_unit_bytes << tiers
+              << " orphans=" << s.orphans << " orphan_bytes=" << s.orphan_bytes
+              << " grace_orphans=" << s.grace_orphans
+              << " grace_orphan_bytes=" << s.grace_orphan_bytes
+              << " blocked=" << s.blocked << " partial=" << s.partial
+              << " lost_members=" << s.lost_members
+              << " lost_pages=" << s.lost_pages
+              << " pending_expired=" << s.pending_expired
+              << " member_conflicts=" << s.member_conflicts
+              << " dropped_refs=" << s.dropped_refs
+              << " headroom_units=" << s.headroom_units
+              << " headroom_unit_bytes=" << s.headroom_unit_bytes
+              << " headroom_orphans=" << s.headroom_orphans
+              << " headroom_orphan_bytes=" << s.headroom_orphan_bytes
+              << " heap=" << s.heap_entries << " clock=" << s.clock;
+}
+
+auto MasterService::ApplyUnitUpdates(const std::vector<UnitUpdate>& updates)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    if (!unit_policy_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    // Puts take the policy's lock under a metadata shard lock: release it
+    // between chunks so that they wait for one chunk at most.
+    constexpr size_t kChunk = 256;
+    const auto now = UnitPolicy::Clock::now();
+    std::vector<std::string> errors;
+    for (size_t begin = 0; begin < updates.size(); begin += kChunk) {
+        const size_t end = std::min(updates.size(), begin + kChunk);
+        for (auto& error : unit_policy_->Apply(
+                 std::vector<UnitUpdate>(updates.begin() + begin,
+                                         updates.begin() + end),
+                 now)) {
+            errors.push_back(std::move(error));
+        }
+    }
+    return errors;
+}
+
+auto MasterService::GetUnitPolicyConfig() const
+    -> tl::expected<UnitPolicyConfig, ErrorCode> {
+    if (!unit_policy_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return unit_policy_->config();
+}
+
+auto MasterService::GetUnitPolicyStats(bool exact) const
+    -> tl::expected<UnitPolicyStats, ErrorCode> {
+    if (!unit_policy_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    const auto now = UnitPolicy::Clock::now();
+    return exact ? unit_policy_->Stats(now) : unit_policy_->Counters(now);
+}
+
+auto MasterService::CheckUnitPolicy() const
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    if (!unit_policy_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return unit_policy_->Check();
+}
+
+void MasterService::RunUnitBatchEvictForTesting(double evict_ratio_target,
+                                                bool dead_only) {
+    UnitBatchEvict(evict_ratio_target, dead_only);
+}
+
+void MasterService::SetUnitEvictBetweenPassesForTesting(
+    std::function<void()> hook) {
+    unit_evict_between_passes_for_testing_ = std::move(hook);
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,

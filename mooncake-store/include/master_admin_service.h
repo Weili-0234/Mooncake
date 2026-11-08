@@ -104,6 +104,13 @@ class MasterAdminServer {
                                  coro_http::coro_http_response& resp);
     void HandleRemoveAll(coro_http::coro_http_request& req,
                          coro_http::coro_http_response& resp);
+    // --eviction_policy=unit_gds: POST a batch of recovery-unit updates; GET
+    // the policy's counters (``check=1``, only with --unit_debug, adds the
+    // units per tier and the self-check's violations).
+    void HandleUnitUpdates(coro_http::coro_http_request& req,
+                           coro_http::coro_http_response& resp);
+    void HandleUnitStats(coro_http::coro_http_request& req,
+                         coro_http::coro_http_response& resp);
 
     void RegisterHandler();
     void RefreshStorageMetrics() const;

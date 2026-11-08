@@ -207,6 +207,12 @@ class MasterService {
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
     void RunDfsEvictionForTesting();
+    // Test-only: one eviction cycle of --eviction_policy=unit_gds.
+    void RunUnitBatchEvictForTesting(double evict_ratio_target,
+                                     bool dead_only = false);
+    // Test-only: called by each unit_gds eviction of a victim after its keys
+    // were checked and before they are erased, with no lock held.
+    void SetUnitEvictBetweenPassesForTesting(std::function<void()> hook);
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -385,6 +391,18 @@ class MasterService {
 
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
+
+    // --eviction_policy=unit_gds: a client's recovery-unit updates (returns
+    // one message per rejected update), the policy's settings, its counters
+    // (``exact`` adds the units per tier: a scan of every unit under the
+    // policy's lock) and its self-check. UNAVAILABLE_IN_CURRENT_MODE under
+    // the lease order.
+    tl::expected<std::vector<std::string>, ErrorCode> ApplyUnitUpdates(
+        const std::vector<UnitUpdate>& updates);
+    tl::expected<UnitPolicyConfig, ErrorCode> GetUnitPolicyConfig() const;
+    tl::expected<UnitPolicyStats, ErrorCode> GetUnitPolicyStats(
+        bool exact = false) const;
+    tl::expected<std::vector<std::string>, ErrorCode> CheckUnitPolicy() const;
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -982,6 +1000,28 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+    // --eviction_policy=unit_gds: evicts orphans and whole recovery units in
+    // the policy's order until ``evict_ratio_target`` of the memory capacity
+    // is freed (bytes, not objects).
+    // With ``dead_only`` (dead_headroom_ratio, below the high watermark):
+    // only orphans and dead units, and no failed eviction is counted when
+    // there is none.
+    void UnitBatchEvict(double evict_ratio_target, bool dead_only = false);
+    struct UnitEvictResult {
+        uint64_t freed_bytes{0};
+        long evicted_objects{0};
+        // A key was not evictable (leased, pinned, its unit used) before any
+        // key went: nothing was erased.
+        bool blocked{false};
+        // False when a key stopped being evictable after another one went.
+        bool complete{true};
+    };
+    // Erases every present key of ``victim`` if each is evictable now (two
+    // passes over the keys' shards; the policy is asked again under each lock).
+    UnitEvictResult EvictForUnitPolicy(
+        const UnitPolicy::Victim& victim,
+        const std::chrono::system_clock::time_point& now);
+    void LogUnitPolicy();
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
     struct TenantQuotaEvictionResult {
@@ -2792,6 +2832,11 @@ class MasterService {
         drain_jobs_ GUARDED_BY(job_mutex_);
 
     std::unique_ptr<KvEventPublisher> kv_event_publisher_;
+    // --eviction_policy=unit_gds, else null (the lease order).
+    std::unique_ptr<UnitPolicy> unit_policy_;
+    std::chrono::system_clock::time_point unit_last_discard_{};
+    std::chrono::system_clock::time_point unit_last_log_{};
+    std::function<void()> unit_evict_between_passes_for_testing_;
 
     static KvEventConfig BuildKvEventConfig(const MasterServiceConfig& config);
     static std::string MediumForReplicaType(ReplicaType replica_type);

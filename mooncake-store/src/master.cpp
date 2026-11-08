@@ -148,6 +148,29 @@ DEFINE_double(eviction_high_watermark_ratio,
               "Ratio of high watermark trigger eviction in Memory");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
+DEFINE_string(eviction_policy, "lease",
+              "Memory eviction order: lease (oldest lease first) or unit_gds "
+              "(recovery units that clients register on the admin port's "
+              "/api/v1/units, GreedyDual-Size, whole units, bytes)");
+DEFINE_bool(unit_leaf_last, true,
+            "unit_gds: dead units first, then inner units, then leaves");
+DEFINE_double(unit_idle_demote_s, 60.0,
+              "unit_gds: a leaf unused this many seconds ranks as an inner "
+              "unit (0 disables)");
+DEFINE_double(unit_orphan_grace_s, 120.0,
+              "unit_gds: seconds before an object no unit owns or references "
+              "may be evicted (earlier only as a full round's last resort)");
+DEFINE_bool(unit_debug, false,
+            "unit_gds: answer /api/v1/units/stats?check=1 (the policy's "
+            "self-check and the units per tier, scans of every unit under "
+            "the policy's lock)");
+DEFINE_bool(unit_anchor_tier, false,
+            "unit_gds with leaf-last: the deepest live aligned unit under a "
+            "live tail ranks with the leaves");
+DEFINE_double(unit_dead_headroom_ratio, 0.0,
+              "unit_gds with leaf-last: from this fraction of the capacity "
+              "below the high watermark on, evict dead units and orphans "
+              "only (0 disables)");
 DEFINE_double(nof_eviction_high_watermark_ratio,
               mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
               "Ratio of high watermark trigger eviction in NoF SSD");
@@ -501,6 +524,25 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("nof_eviction_high_watermark_ratio",
                              &master_config.nof_eviction_high_watermark_ratio,
                              FLAGS_nof_eviction_high_watermark_ratio);
+    default_config.GetString("eviction_policy", &master_config.eviction_policy,
+                             FLAGS_eviction_policy);
+    default_config.GetBool("unit_leaf_last",
+                           &master_config.unit_policy.leaf_last,
+                           FLAGS_unit_leaf_last);
+    default_config.GetDouble("unit_idle_demote_s",
+                             &master_config.unit_policy.idle_demote_s,
+                             FLAGS_unit_idle_demote_s);
+    default_config.GetDouble("unit_orphan_grace_s",
+                             &master_config.unit_policy.orphan_grace_s,
+                             FLAGS_unit_orphan_grace_s);
+    default_config.GetBool("unit_debug", &master_config.unit_policy.debug,
+                           FLAGS_unit_debug);
+    default_config.GetBool("unit_anchor_tier",
+                           &master_config.unit_policy.anchor_tier,
+                           FLAGS_unit_anchor_tier);
+    default_config.GetDouble("unit_dead_headroom_ratio",
+                             &master_config.unit_policy.dead_headroom_ratio,
+                             FLAGS_unit_dead_headroom_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
@@ -880,6 +922,42 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.nof_eviction_high_watermark_ratio =
             FLAGS_nof_eviction_high_watermark_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("eviction_policy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.eviction_policy = FLAGS_eviction_policy;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_leaf_last", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.leaf_last = FLAGS_unit_leaf_last;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_idle_demote_s", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.idle_demote_s = FLAGS_unit_idle_demote_s;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_orphan_grace_s", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.orphan_grace_s = FLAGS_unit_orphan_grace_s;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_debug", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.debug = FLAGS_unit_debug;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_anchor_tier", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.anchor_tier = FLAGS_unit_anchor_tier;
+    }
+    if ((google::GetCommandLineFlagInfo("unit_dead_headroom_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.unit_policy.dead_headroom_ratio =
+            FLAGS_unit_dead_headroom_ratio;
     }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
@@ -1428,6 +1506,16 @@ int main(int argc, char* argv[]) {
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     ResolveRpcAddressFromInterfaceOrDie(master_config);
+    if (master_config.eviction_policy != "lease" &&
+        master_config.eviction_policy != "unit_gds") {
+        LOG(FATAL) << "eviction_policy must be lease or unit_gds, got "
+                   << master_config.eviction_policy;
+    }
+    master_config.unit_policy.enabled =
+        master_config.eviction_policy == "unit_gds";
+    if (master_config.unit_policy.enabled && master_config.enable_ha) {
+        LOG(FATAL) << "eviction_policy unit_gds excludes enable_ha";
+    }
 
     // Fall back to environment variables for pod identity (K8s Downward API)
     if (master_config.pod_name.empty()) {
@@ -1531,6 +1619,7 @@ int main(int argc, char* argv[]) {
         << ", allow_evict_soft_pinned_objects="
         << master_config.allow_evict_soft_pinned_objects
         << ", eviction_ratio=" << master_config.eviction_ratio
+        << ", eviction_policy=" << master_config.eviction_policy
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha

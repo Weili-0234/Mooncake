@@ -86,6 +86,13 @@ struct HttpSegmentsDetailResponse {
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
 
+struct HttpUnitUpdateResponse {
+    bool success{false};
+    uint64_t applied{0};
+    std::vector<std::string> errors;
+};
+YLT_REFL(HttpUnitUpdateResponse, success, applied, errors);
+
 std::string WriteTenantQuotaPolicyForTest(
     const std::map<std::string, uint64_t>& tenant_quotas) {
     TenantQuotaPolicySnapshot snapshot;
@@ -1280,6 +1287,230 @@ TEST_F(MasterAdminServerTest, BatchQueryKeysReturnsLocalDiskReplicaInfo) {
     EXPECT_NE(resp.body.find(endpoint), std::string::npos);
     // Backward compat: a disk-only key still reports an (empty) values array.
     EXPECT_NE(resp.body.find("\"values\":[]"), std::string::npos);
+
+    admin.Stop();
+}
+
+// =========================================================================
+// Recovery-unit endpoints (--eviction_policy=unit_gds)
+// =========================================================================
+
+TEST_F(MasterAdminServerTest, UnitEndpointsReturn503WhenServiceUnavailable) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    auto units = HttpPostJson(port, "/api/v1/units", R"({"updates": []})");
+    EXPECT_EQ(units.http_status, 503);
+    auto stats = HttpGet(port, "/api/v1/units/stats");
+    EXPECT_EQ(stats.http_status, 503);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, UnitEndpointsAreRefusedUnderTheLeaseOrder) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto units = HttpPostJson(port, "/api/v1/units",
+                              R"({"updates": [{"op": "touch", "id": "u"}]})");
+    EXPECT_EQ(units.http_status, 409);
+    HttpErrorResponse error;
+    struct_json::from_json(error, units.body);
+    EXPECT_EQ(error.error_code, toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE));
+    EXPECT_EQ(HttpGet(port, "/api/v1/units/stats").http_status, 409);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, UnitEndpointsApplyUpdatesAndReportTheCheck) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.unit_policy.enabled = true;
+    svc_config.unit_policy.debug = true;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto post = [&](const std::string& body, HttpUnitUpdateResponse& out) {
+        auto resp = HttpPostJson(port, "/api/v1/units", body);
+        if (resp.http_status == 200) {
+            struct_json::from_json(out, resp.body);
+        }
+        return resp.http_status;
+    };
+
+    // One valid upsert, one without members and one with a negative value.
+    HttpUnitUpdateResponse applied;
+    EXPECT_EQ(post(R"({"updates": [
+        {"op": "upsert", "id": "u1", "value": 2.5, "aligned": true,
+         "members": ["s1"], "refs": ["p0", "p1"]},
+        {"op": "upsert", "id": "u2", "value": 1.0},
+        {"op": "upsert", "id": "u3", "value": -1.0, "members": ["s3"]},
+        {"op": "touch", "id": "u1"},
+        {"op": "dead", "id": "unknown"}]})",
+                   applied),
+              200);
+    EXPECT_FALSE(applied.success);
+    EXPECT_EQ(applied.applied, 3u);
+    ASSERT_EQ(applied.errors.size(), 2u);
+
+    EXPECT_EQ(HttpPostJson(port, "/api/v1/units", "{not json").http_status,
+              400);
+    EXPECT_EQ(HttpPostJson(port, "/api/v1/units",
+                           R"({"updates": [{"op": "evict", "id": "u1"}]})")
+                  .http_status,
+              400);
+    // The self-check's positive control is test-only, not an update.
+    EXPECT_EQ(HttpPostJson(port, "/api/v1/units",
+                           R"({"updates": [{"op": "debug_unref", "id": "*"}]})")
+                  .http_status,
+              400);
+    EXPECT_EQ(HttpPostJson(port, "/api/v1/units",
+                           R"({"updates": [{"op": "upsert", "id": "u4",
+                               "members": "s4"}]})")
+                  .http_status,
+              400);
+
+    auto stats = HttpGet(port, "/api/v1/units/stats");
+    ASSERT_EQ(stats.http_status, 200);
+    EXPECT_NE(stats.body.find("\"units\":1"), std::string::npos);
+    EXPECT_NE(stats.body.find("\"upserts\":1"), std::string::npos);
+    EXPECT_NE(stats.body.find("\"touches\":1"), std::string::npos);
+    EXPECT_NE(stats.body.find("\"dead_unknown\":1"), std::string::npos);
+    EXPECT_NE(stats.body.find("\"checked\":false"), std::string::npos);
+
+    auto checked = HttpGet(port, "/api/v1/units/stats?check=1");
+    ASSERT_EQ(checked.http_status, 200);
+    EXPECT_NE(checked.body.find("\"checked\":true"), std::string::npos);
+    EXPECT_NE(checked.body.find("\"violations\":[]"), std::string::npos);
+
+    admin.Stop();
+}
+
+// Without check=1 the stats are counters, the tier counts 0; check=1 (the
+// tier counts and the self-check, scans of every unit) needs --unit_debug.
+TEST_F(MasterAdminServerTest, UnitStatsCountTheTiersOnlyWithTheCheck) {
+    for (const bool debug : {false, true}) {
+        WrappedMasterServiceConfig svc_config;
+        svc_config.default_kv_lease_ttl = 5000;
+        svc_config.enable_metric_reporting = false;
+        svc_config.unit_policy.enabled = true;
+        svc_config.unit_policy.debug = debug;
+        auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+        int port = getFreeTcpPort();
+        MasterAdminServer admin(static_cast<uint16_t>(port), false);
+        ASSERT_TRUE(admin.Start());
+        admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+        admin.SetServiceDelegate(service);
+        admin.SetServiceAvailable(true);
+
+        ASSERT_EQ(HttpPostJson(port, "/api/v1/units",
+                               R"({"updates": [{"op": "upsert", "id": "u1",
+                                   "value": 1.0, "members": ["s1"]}]})")
+                      .http_status,
+                  200);
+        auto stats = HttpGet(port, "/api/v1/units/stats");
+        ASSERT_EQ(stats.http_status, 200);
+        EXPECT_NE(stats.body.find("\"units\":1"), std::string::npos);
+        EXPECT_NE(stats.body.find("\"units_leaf\":0"), std::string::npos);
+        EXPECT_NE(stats.body.find("\"checked\":false"), std::string::npos);
+        auto checked = HttpGet(port, "/api/v1/units/stats?check=1");
+        if (debug) {
+            ASSERT_EQ(checked.http_status, 200);
+            EXPECT_NE(checked.body.find("\"units_leaf\":1"), std::string::npos);
+            EXPECT_NE(checked.body.find("\"checked\":true"), std::string::npos);
+            EXPECT_NE(checked.body.find("\"violations\":[]"),
+                      std::string::npos);
+        } else {
+            EXPECT_EQ(checked.http_status, 400) << checked.body;
+        }
+        admin.Stop();
+    }
+}
+
+// A body that is not a batch of well-typed updates is refused with 400 (not
+// an exception the server answers with 503), and so is a batch of more than
+// 4096 updates; a full batch applies in order across the master's chunks.
+TEST_F(MasterAdminServerTest, UnitUpdatesAreTypeCheckedAndCapped) {
+    WrappedMasterServiceConfig svc_config;
+    svc_config.default_kv_lease_ttl = 5000;
+    svc_config.enable_metric_reporting = false;
+    svc_config.unit_policy.enabled = true;
+    auto service = std::make_shared<WrappedMasterService>(svc_config);
+
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto batch = [](const std::vector<std::string>& updates) {
+        std::string body = R"({"updates": [)";
+        for (size_t i = 0; i < updates.size(); ++i) {
+            body += (i > 0 ? "," : "") + updates[i];
+        }
+        return body + "]}";
+    };
+    const std::vector<std::string> invalid = {
+        "[1]",
+        "5",
+        std::string(1100, '['),
+        R"({"updates": [{"op": "upsert", "id": {}}]})",
+        R"({"updates": [{"op": 7, "id": "u"}]})",
+        R"({"updates": [{"op": "upsert", "id": "u", "parent": 3,
+            "members": ["m"]}]})",
+        R"({"updates": [{"op": "upsert", "id": "u", "aligned": "x",
+            "members": ["m"]}]})",
+        R"({"updates": [{"op": "upsert", "id": "u", "value": "1",
+            "members": ["m"]}]})",
+        R"({"updates": [{"op": "upsert", "id": "u", "members": ["m"],
+            "refs": [1]}]})",
+        batch(std::vector<std::string>(4097, R"({"op": "touch", "id": "u"})")),
+    };
+    for (const auto& body : invalid) {
+        EXPECT_EQ(HttpPostJson(port, "/api/v1/units", body).http_status, 400)
+            << body.substr(0, 80);
+    }
+    EXPECT_NE(HttpGet(port, "/api/v1/units/stats").body.find("\"upserts\":0"),
+              std::string::npos);
+
+    // 300 units, then 3796 touches of them: 4096 updates in order.
+    std::vector<std::string> updates;
+    for (int i = 0; i < 4096; ++i) {
+        const std::string id = "u" + std::to_string(i % 300);
+        updates.push_back(i < 300 ? R"({"op": "upsert", "id": ")" + id +
+                                        R"(", "value": 1.0, "members": [")" +
+                                        id + R"(.m"]})"
+                                  : R"({"op": "touch", "id": ")" + id + "\"}");
+    }
+    auto resp = HttpPostJson(port, "/api/v1/units", batch(updates));
+    ASSERT_EQ(resp.http_status, 200);
+    HttpUnitUpdateResponse applied;
+    struct_json::from_json(applied, resp.body);
+    EXPECT_TRUE(applied.success);
+    EXPECT_EQ(applied.applied, 4096u);
+    auto stats = HttpGet(port, "/api/v1/units/stats");
+    EXPECT_NE(stats.body.find("\"touches\":3796"), std::string::npos);
+    EXPECT_NE(stats.body.find("\"touch_unknown\":0"), std::string::npos);
 
     admin.Stop();
 }
